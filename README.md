@@ -242,6 +242,11 @@ chmod +x sbox-linux-amd64
 mv sbox-linux-amd64 /usr/local/bin/sbox
 ```
 
+> **New here?** Start with:
+> 1. [Quick Start](#quick-start)
+> 2. [Privacy & Isolation](#privacy--isolation)
+> 3. [Packaging & Distribution](#packaging--distribution)
+
 ## Quick Start
 
 ### Python Project
