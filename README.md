@@ -2,6 +2,8 @@
 
 A secure sandbox for running AI agents with enforced isolation - **no Docker or sudo required**.
 
+**If a file is not mounted, it does not exist to the agent.**
+
 > *"Don't trust the agent. Trust the sandbox."*
 >
 > sbox enforces isolation through environment, not promises. Your files are protected not because the agent behaves, but because they simply don't exist in its world.
