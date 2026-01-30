@@ -56,6 +56,77 @@ sbox run
 - **Process management** - Background daemons, logs, and monitoring
 - **Fast setup** - Uses micromamba for quick environment creation
 
+## Example: Running OpenClaw in sbox
+
+This example shows how sbox isolates an AI agent like [OpenClaw](https://github.com/openclaw/openclaw) from your host system.
+
+### The Isolation Model
+
+When OpenClaw runs inside sbox, it sees a completely different filesystem:
+
+```
+What the agent sees:          What actually exists on host:
+─────────────────────         ────────────────────────────
+/                             .sbox/rootfs/
+├── app/                      .sbox/rootfs/app/
+│   └── openclaw/             .sbox/rootfs/app/openclaw/
+├── home/                     .sbox/rootfs/home/        ← virtual HOME
+│   ├── .npm/                 .sbox/rootfs/home/.npm/   ← npm cache isolated
+│   └── .config/              .sbox/rootfs/home/.config/
+└── tmp/                      .sbox/rootfs/tmp/
+
+Files invisible to agent:
+  ~/.ssh/*           (your SSH keys)
+  ~/.aws/*           (cloud credentials)
+  ~/.config/*        (app configs, tokens)
+  ~/Documents/*      (personal files)
+```
+
+### Virtual HOME Directory
+
+The agent's HOME is redirected to `.sbox/rootfs/home/`:
+
+| Environment Variable | Value inside sbox |
+|---------------------|-------------------|
+| `HOME` | `/path/to/project/.sbox/rootfs/home` |
+| `TMPDIR` | `/path/to/project/.sbox/rootfs/tmp` |
+| `npm_config_cache` | Points to sandbox-local npm cache |
+
+This means:
+- `npm install` writes to the sandbox, not `~/.npm`
+- Config files created by the agent stay in the sandbox
+- The agent cannot discover or access your real home directory
+
+### Directory Layout After Build
+
+```
+openclaw-sandbox/
+├── .sbox/
+│   ├── config.yaml        # What files to copy, what command to run
+│   ├── env/               # Isolated Node.js runtime
+│   │   ├── bin/node
+│   │   └── bin/pnpm
+│   ├── rootfs/            # The agent's entire world
+│   │   ├── app/openclaw/  # Application code
+│   │   ├── home/          # Agent's HOME (empty by default)
+│   │   └── tmp/           # Agent's temp directory
+│   └── env.sh             # Environment activation script
+└── sbox.lock              # Build state
+```
+
+### What the Agent Can and Cannot Do
+
+| Action | Allowed? | Reason |
+|--------|----------|--------|
+| Read/write files in `/app/` | Yes | Explicitly copied into sandbox |
+| Install npm packages | Yes | Writes to sandbox-local directories |
+| Read `~/.ssh/id_rsa` | No | Does not exist in sandbox |
+| Access `~/.aws/credentials` | No | Does not exist in sandbox |
+| Create files in `~/` | Yes* | Creates in virtual HOME, not real HOME |
+| Run system commands | Limited | Only what's in the sandbox runtime |
+
+*Files created in the agent's `~/` end up in `.sbox/rootfs/home/`, completely separate from your real home directory.
+
 ## Installation
 
 ### Build from source
