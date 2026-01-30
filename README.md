@@ -24,6 +24,8 @@ Think of it as a lightweight container specifically designed for AI agent worklo
 
 ## Privacy & Isolation
 
+> **Note:** sbox provides filesystem and environment isolation in user space. It is not a kernel-level security sandbox.
+
 Some AI agent tools (such as [OpenClaw](https://github.com/openclaw/openclaw)) run directly with user-level permissions by default. This means the agent may technically access your entire home directory, including private files, unless additional measures are taken.
 
 **sbox solves this problem by design.**
