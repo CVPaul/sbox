@@ -5,7 +5,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/sbox-project/sbox/internal/builder"
+	"github.com/sbox-project/sbox/internal/cache"
 	"github.com/sbox-project/sbox/internal/config"
 	"github.com/sbox-project/sbox/internal/console"
 	"github.com/sbox-project/sbox/internal/process"
@@ -20,7 +23,7 @@ import (
 	"github.com/sbox-project/sbox/internal/validate"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 func main() {
 	rootCmd := &cobra.Command{
@@ -197,6 +200,135 @@ Checks for:
 	validateCmd.Flags().BoolP("quiet", "q", false, "Only show errors, not warnings")
 	validateCmd.Flags().Bool("fix", false, "Attempt to fix common issues")
 	rootCmd.AddCommand(validateCmd)
+
+	// Cache command group
+	cacheCmd := &cobra.Command{
+		Use:   "cache",
+		Short: "Manage the global runtime cache",
+		Long: `Manage the global sbox runtime cache.
+
+The cache stores downloaded runtimes (Python, Node.js) and the micromamba
+binary to avoid repeated downloads across projects.
+
+Cache location: ~/.sbox/cache/`,
+	}
+
+	// Cache list subcommand
+	cacheListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List cached runtimes",
+		Run:   runCacheList,
+	}
+	cacheListCmd.Flags().BoolP("json", "j", false, "Output as JSON")
+	cacheCmd.AddCommand(cacheListCmd)
+
+	// Cache clean subcommand
+	cacheCleanCmd := &cobra.Command{
+		Use:   "clean [runtime]",
+		Short: "Remove cached runtimes",
+		Long: `Remove cached runtimes from the global cache.
+
+If no runtime is specified, removes all cached data.
+Specify a runtime like 'python-3.10' or 'node-22' to remove only that runtime.`,
+		Run: runCacheClean,
+	}
+	cacheCleanCmd.Flags().BoolP("all", "a", false, "Remove all cache including micromamba")
+	cacheCmd.AddCommand(cacheCleanCmd)
+
+	// Cache prune subcommand
+	cachePruneCmd := &cobra.Command{
+		Use:   "prune",
+		Short: "Remove unused cached runtimes",
+		Long: `Remove cached runtimes that haven't been used recently.
+
+By default, removes runtimes not used in the last 30 days.`,
+		Run: runCachePrune,
+	}
+	cachePruneCmd.Flags().Duration("older-than", 30*24*time.Hour, "Remove runtimes unused for longer than this duration")
+	cacheCmd.AddCommand(cachePruneCmd)
+
+	// Cache path subcommand
+	cacheCmd.AddCommand(&cobra.Command{
+		Use:   "path",
+		Short: "Show cache directory path",
+		Run:   runCachePath,
+	})
+
+	// Cache info subcommand
+	cacheInfoCmd := &cobra.Command{
+		Use:   "info",
+		Short: "Show detailed cache information",
+		Run:   runCacheInfo,
+	}
+	cacheInfoCmd.Flags().BoolP("json", "j", false, "Output as JSON")
+	cacheCmd.AddCommand(cacheInfoCmd)
+
+	rootCmd.AddCommand(cacheCmd)
+
+	// Pack command
+	packCmd := &cobra.Command{
+		Use:   "pack [output]",
+		Short: "Package the sandbox into a portable archive",
+		Long: `Package the current sandbox into a portable tar.gz archive.
+
+The archive includes:
+  - .sbox/rootfs/     All sandbox files
+  - .sbox/env/        Runtime environment  
+  - .sbox/config.yaml Configuration
+  - metadata.json     Build metadata
+
+The archive can be extracted manually with:
+  tar -xzf archive.tar.gz
+
+Then run with:
+  cd extracted-dir && sbox run
+
+This workflow provides security benefits:
+  - Users can inspect contents before running
+  - No automatic code execution on extract
+  - Standard tools for verification`,
+		Run: runPack,
+	}
+	packCmd.Flags().StringP("output", "o", "", "Output file path (default: <project>-sbox.tar.gz)")
+	packCmd.Flags().Bool("include-cache", false, "Include local mamba cache (larger archive)")
+	packCmd.Flags().Bool("exclude-env", false, "Exclude runtime environment (recipient must run sbox build)")
+	rootCmd.AddCommand(packCmd)
+
+	// Unpack command
+	unpackCmd := &cobra.Command{
+		Use:   "unpack [directory]",
+		Short: "Relocate paths in an extracted sbox archive",
+		Long: `Relocate embedded paths in an extracted sbox archive for the new location.
+
+This command is similar to conda-unpack: it fixes hardcoded paths in the
+environment without executing any code or downloading anything.
+
+SECURITY BOUNDARY:
+  - Does NOT execute any code
+  - Does NOT download anything  
+  - Does NOT run install commands
+  - ONLY performs text replacement in configuration files
+
+What it does:
+  1. Regenerates .sbox/env.sh with correct paths
+  2. Updates conda-meta/*.json prefix paths
+  3. Fixes shebang lines in scripts (if any)
+  4. Updates sbox.lock with new location
+
+Typical workflow:
+  1. Build on source:     sbox build && sbox pack
+  2. Transfer archive:    scp project-sbox.tar.gz user@host:/path/
+  3. Extract on target:   tar -xzf project-sbox.tar.gz
+  4. Relocate paths:      cd project && sbox unpack
+  5. Run:                 sbox run
+
+The unpack step is required when the extraction path differs from the
+original build path. Without it, hardcoded paths will be incorrect.`,
+		Run: runUnpack,
+	}
+	unpackCmd.Flags().Bool("verbose", false, "Show detailed relocation information")
+	unpackCmd.Flags().Bool("dry-run", false, "Show what would be changed without making changes")
+	rootCmd.AddCommand(unpackCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -1050,9 +1182,22 @@ func runInfo(cmd *cobra.Command, args []string) {
 
 	// Copy specs
 	if len(cfg.Copy) > 0 {
-		console.Print("  ┌─ File Mappings")
+		console.Print("  ┌─ File Mappings (copy)")
 		for _, spec := range cfg.ParseCopy() {
 			console.Print("  │  %s → %s", spec.Src, spec.Dst)
+		}
+		fmt.Println()
+	}
+
+	// Mount specs
+	if len(cfg.Mount) > 0 {
+		console.Print("  ┌─ Directory Mounts (symlink)")
+		for _, spec := range cfg.ParseMount() {
+			mode := "rw"
+			if spec.ReadOnly {
+				mode = "ro"
+			}
+			console.Print("  │  %s → %s (%s)", spec.Src, spec.Dst, mode)
 		}
 		fmt.Println()
 	}
@@ -1204,7 +1349,958 @@ func runValidate(cmd *cobra.Command, args []string) {
 	console.Print("  │  Workdir:  %s", cfg.Workdir)
 	console.Print("  │  Command:  %s", cfg.Cmd)
 	console.Print("  │  Copy:     %d mapping(s)", len(cfg.Copy))
+	console.Print("  │  Mount:    %d mount(s)", len(cfg.Mount))
 	console.Print("  │  Install:  %d command(s)", len(cfg.Install))
 	console.Print("  │  Env vars: %d defined", len(cfg.Env))
 	fmt.Println()
+}
+
+// Cache command handlers
+
+func runCacheList(cmd *cobra.Command, args []string) {
+	asJSON, _ := cmd.Flags().GetBool("json")
+
+	cm, err := cache.NewManager()
+	if err != nil {
+		console.Fatal("Failed to initialize cache: %s", err)
+	}
+
+	runtimes, err := cm.ListCachedRuntimes()
+	if err != nil {
+		console.Fatal("Failed to list cached runtimes: %s", err)
+	}
+
+	if asJSON {
+		data, _ := json.MarshalIndent(runtimes, "", "  ")
+		fmt.Println(string(data))
+		return
+	}
+
+	if len(runtimes) == 0 {
+		console.Info("No cached runtimes found")
+		console.Print("  Cache location: %s", cm.CacheRoot)
+		console.Print("  Runtimes will be cached automatically during 'sbox build'")
+		return
+	}
+
+	fmt.Println()
+	console.Step("Cached Runtimes")
+	fmt.Println()
+
+	fmt.Printf("  %-20s %-12s %-20s %s\n", "RUNTIME", "SIZE", "LAST USED", "PATH")
+	fmt.Printf("  %-20s %-12s %-20s %s\n", "-------", "----", "---------", "----")
+
+	for _, r := range runtimes {
+		key := cache.GetRuntimeKey(r.Language, r.Version)
+		lastUsed := r.LastUsed.Format("2006-01-02 15:04")
+		size := cache.FormatBytes(r.Size)
+		fmt.Printf("  %-20s %-12s %-20s %s\n", key, size, lastUsed, r.Path)
+	}
+
+	fmt.Println()
+
+	// Show micromamba status
+	if cm.IsMicromambaCached() {
+		console.Print("  micromamba: cached")
+	}
+
+	// Show total size
+	info, _ := cm.GetCacheInfo()
+	if info != nil {
+		console.Print("  Total cache size: %s", cache.FormatBytes(info.TotalSize))
+	}
+	fmt.Println()
+}
+
+func runCacheClean(cmd *cobra.Command, args []string) {
+	cleanAll, _ := cmd.Flags().GetBool("all")
+
+	cm, err := cache.NewManager()
+	if err != nil {
+		console.Fatal("Failed to initialize cache: %s", err)
+	}
+
+	if len(args) > 0 {
+		// Clean specific runtime
+		runtimeKey := args[0]
+		
+		// Parse runtime key (e.g., "python-3.10" -> language="python", version="3.10")
+		var language, version string
+		for _, prefix := range []string{"python-", "node-", "nodejs-"} {
+			if len(runtimeKey) > len(prefix) && runtimeKey[:len(prefix)] == prefix {
+				language = prefix[:len(prefix)-1]
+				version = runtimeKey[len(prefix):]
+				break
+			}
+		}
+
+		if language == "" {
+			console.Fatal("Invalid runtime format: %s\n  Expected format: python-3.10 or node-22", runtimeKey)
+		}
+
+		console.Step("Removing cached runtime: %s", runtimeKey)
+		if err := cm.CleanRuntime(language, version); err != nil {
+			console.Fatal("Failed to remove runtime: %s", err)
+		}
+		console.Success("Runtime removed from cache")
+		return
+	}
+
+	if cleanAll {
+		console.Step("Removing all cached data...")
+		if err := cm.CleanCache(); err != nil {
+			console.Fatal("Failed to clean cache: %s", err)
+		}
+		console.Success("Cache cleared completely")
+	} else {
+		// Only clean runtimes, keep micromamba
+		runtimes, _ := cm.ListCachedRuntimes()
+		if len(runtimes) == 0 {
+			console.Info("No cached runtimes to remove")
+			return
+		}
+
+		console.Step("Removing %d cached runtime(s)...", len(runtimes))
+		for _, r := range runtimes {
+			if err := cm.CleanRuntime(r.Language, r.Version); err != nil {
+				console.Warning("Failed to remove %s-%s: %s", r.Language, r.Version, err)
+			} else {
+				console.Print("  Removed: %s-%s", r.Language, r.Version)
+			}
+		}
+		console.Success("Cached runtimes removed")
+		console.Info("Use 'sbox cache clean --all' to also remove micromamba")
+	}
+}
+
+func runCachePrune(cmd *cobra.Command, args []string) {
+	olderThan, _ := cmd.Flags().GetDuration("older-than")
+
+	cm, err := cache.NewManager()
+	if err != nil {
+		console.Fatal("Failed to initialize cache: %s", err)
+	}
+
+	console.Step("Pruning runtimes not used in %s...", formatDuration(olderThan))
+
+	pruned, err := cm.PruneCache(olderThan)
+	if err != nil {
+		console.Fatal("Failed to prune cache: %s", err)
+	}
+
+	if pruned == 0 {
+		console.Info("No runtimes to prune")
+	} else {
+		console.Success("Pruned %d runtime(s)", pruned)
+	}
+}
+
+func runCachePath(cmd *cobra.Command, args []string) {
+	cacheDir, err := cache.GetGlobalCacheDir()
+	if err != nil {
+		console.Fatal("Failed to get cache path: %s", err)
+	}
+	fmt.Println(cacheDir)
+}
+
+func runCacheInfo(cmd *cobra.Command, args []string) {
+	asJSON, _ := cmd.Flags().GetBool("json")
+
+	cm, err := cache.NewManager()
+	if err != nil {
+		console.Fatal("Failed to initialize cache: %s", err)
+	}
+
+	info, err := cm.GetCacheInfo()
+	if err != nil {
+		console.Fatal("Failed to get cache info: %s", err)
+	}
+
+	if asJSON {
+		data, _ := json.MarshalIndent(info, "", "  ")
+		fmt.Println(string(data))
+		return
+	}
+
+	fmt.Println()
+	console.Step("Cache Information")
+	fmt.Println()
+
+	console.Print("  ┌─ Location")
+	console.Print("  │  Path:       %s", info.Path)
+	console.Print("  │  Total size: %s", cache.FormatBytes(info.TotalSize))
+	fmt.Println()
+
+	console.Print("  ┌─ Cached Runtimes (%d)", info.RuntimeCount)
+	if info.RuntimeCount == 0 {
+		console.Print("  │  No runtimes cached yet")
+	} else {
+		for _, r := range info.Runtimes {
+			console.Print("  │  • %s-%s (%s)", r.Language, r.Version, cache.FormatBytes(r.Size))
+			console.Print("  │    Last used: %s", r.LastUsed.Format("2006-01-02 15:04:05"))
+		}
+	}
+	fmt.Println()
+
+	console.Print("  ┌─ Micromamba")
+	if cm.IsMicromambaCached() {
+		mambaPath := cm.GetMicromambaPath()
+		if info, err := os.Stat(mambaPath); err == nil {
+			console.Print("  │  Status: Cached")
+			console.Print("  │  Size:   %s", cache.FormatBytes(info.Size()))
+			console.Print("  │  Path:   %s", mambaPath)
+		}
+	} else {
+		console.Print("  │  Status: Not cached")
+	}
+	fmt.Println()
+
+	console.Print("  ┌─ Commands")
+	console.Print("  │  sbox cache list      List cached runtimes")
+	console.Print("  │  sbox cache clean     Remove all cached runtimes")
+	console.Print("  │  sbox cache prune     Remove old unused runtimes")
+	console.Print("  │  sbox cache path      Show cache directory path")
+	fmt.Println()
+}
+
+// Pack command handler
+
+func runPack(cmd *cobra.Command, args []string) {
+	projectRoot, err := config.GetProjectRoot("")
+	if err != nil {
+		console.Fatal("Not in an sbox project. Run 'sbox init <name>' first.")
+	}
+
+	// Check if project is built
+	if !config.IsBuilt(projectRoot) {
+		console.Fatal("Project is not built. Run 'sbox build' first.")
+	}
+
+	outputPath, _ := cmd.Flags().GetString("output")
+	includeCache, _ := cmd.Flags().GetBool("include-cache")
+	excludeEnv, _ := cmd.Flags().GetBool("exclude-env")
+
+	projectName := filepath.Base(projectRoot)
+
+	// Determine output file
+	if outputPath == "" {
+		outputPath = filepath.Join(projectRoot, fmt.Sprintf("%s-sbox.tar.gz", projectName))
+	}
+	if len(args) > 0 {
+		outputPath = args[0]
+	}
+
+	// Make output path absolute
+	if !filepath.IsAbs(outputPath) {
+		outputPath = filepath.Join(projectRoot, outputPath)
+	}
+
+	console.Step("Packing sandbox: %s", projectName)
+	fmt.Println()
+
+	// Load config for metadata
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		console.Fatal("Failed to load config: %s", err)
+	}
+
+	// Create metadata
+	metadata := createPackMetadata(projectRoot, cfg)
+
+	// Create temporary directory for packing
+	tmpDir, err := os.MkdirTemp("", "sbox-pack-")
+	if err != nil {
+		console.Fatal("Failed to create temp directory: %s", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	packDir := filepath.Join(tmpDir, projectName)
+	sboxPackDir := filepath.Join(packDir, ".sbox")
+
+	// Create pack directory structure
+	if err := os.MkdirAll(sboxPackDir, 0755); err != nil {
+		console.Fatal("Failed to create pack directory: %s", err)
+	}
+
+	// Copy .sbox/config.yaml
+	console.Step("Copying configuration...")
+	srcConfig := filepath.Join(config.GetSboxDir(projectRoot), "config.yaml")
+	dstConfig := filepath.Join(sboxPackDir, "config.yaml")
+	if err := copyFileForPack(srcConfig, dstConfig); err != nil {
+		console.Fatal("Failed to copy config: %s", err)
+	}
+
+	// Copy .sbox/rootfs/
+	console.Step("Copying rootfs...")
+	srcRootfs := config.GetRootfsDir(projectRoot)
+	dstRootfs := filepath.Join(sboxPackDir, "rootfs")
+	if _, err := os.Stat(srcRootfs); err == nil {
+		if err := copyDirForPack(srcRootfs, dstRootfs); err != nil {
+			console.Fatal("Failed to copy rootfs: %s", err)
+		}
+		console.Info("Copied rootfs (%s)", formatBytes(getDirSize(dstRootfs)))
+	}
+
+	// Copy .sbox/env/ (runtime environment)
+	if !excludeEnv {
+		console.Step("Copying runtime environment...")
+		srcEnv := config.GetEnvDir(projectRoot)
+		dstEnv := filepath.Join(sboxPackDir, "env")
+		if _, err := os.Stat(srcEnv); err == nil {
+			if err := copyDirForPack(srcEnv, dstEnv); err != nil {
+				console.Fatal("Failed to copy env: %s", err)
+			}
+			console.Info("Copied env (%s)", formatBytes(getDirSize(dstEnv)))
+		}
+	} else {
+		console.Info("Excluding runtime environment (--exclude-env)")
+	}
+
+	// Copy .sbox/bin/ (micromamba)
+	if !excludeEnv {
+		srcBin := filepath.Join(config.GetSboxDir(projectRoot), "bin")
+		dstBin := filepath.Join(sboxPackDir, "bin")
+		if _, err := os.Stat(srcBin); err == nil {
+			if err := copyDirForPack(srcBin, dstBin); err != nil {
+				console.Warning("Failed to copy bin: %s", err)
+			}
+		}
+	}
+
+	// Optionally include mamba cache
+	if includeCache {
+		console.Step("Copying mamba cache...")
+		srcMamba := filepath.Join(config.GetSboxDir(projectRoot), "mamba")
+		dstMamba := filepath.Join(sboxPackDir, "mamba")
+		if _, err := os.Stat(srcMamba); err == nil {
+			if err := copyDirForPack(srcMamba, dstMamba); err != nil {
+				console.Warning("Failed to copy mamba cache: %s", err)
+			} else {
+				console.Info("Copied mamba cache (%s)", formatBytes(getDirSize(dstMamba)))
+			}
+		}
+	}
+
+	// Copy sbox.lock
+	srcLock := config.GetLockPath(projectRoot)
+	dstLock := filepath.Join(packDir, "sbox.lock")
+	if _, err := os.Stat(srcLock); err == nil {
+		copyFileForPack(srcLock, dstLock)
+	}
+
+	// Write metadata.json
+	console.Step("Writing metadata...")
+	metadataPath := filepath.Join(packDir, "metadata.json")
+	metadataBytes, _ := json.MarshalIndent(metadata, "", "  ")
+	if err := os.WriteFile(metadataPath, metadataBytes, 0644); err != nil {
+		console.Fatal("Failed to write metadata: %s", err)
+	}
+
+	// Create README for the archive
+	readmePath := filepath.Join(packDir, "README.txt")
+	readmeContent := fmt.Sprintf(`sbox Portable Archive
+=====================
+
+Project: %s
+Runtime: %s
+Packed:  %s
+
+How to use:
+-----------
+1. Extract this archive:
+   tar -xzf %s
+
+2. Navigate to the extracted directory:
+   cd %s
+
+3. Run the sandbox:
+   sbox run
+
+Note: You need sbox installed on the target system.
+      Install from: https://github.com/CVPaul/sbox
+
+Security:
+---------
+Always inspect the contents before running:
+- Check .sbox/config.yaml for the command that will run
+- Review .sbox/rootfs/ for the application files
+- Verify metadata.json for build information
+
+This archive uses standard tar+gzip format and can be
+inspected with any standard tools before extraction.
+`, projectName, cfg.Runtime, metadata["packed_at"], filepath.Base(outputPath), projectName)
+
+	if err := os.WriteFile(readmePath, []byte(readmeContent), 0644); err != nil {
+		console.Warning("Failed to write README: %s", err)
+	}
+
+	// Create tar.gz archive
+	console.Step("Creating archive...")
+	
+	// Use system tar for better compatibility and symlink handling
+	tarCmd := fmt.Sprintf("cd %s && tar -czf %s %s", tmpDir, outputPath, projectName)
+	execCmd := exec.Command("sh", "-c", tarCmd)
+	execCmd.Stderr = os.Stderr
+	if err := execCmd.Run(); err != nil {
+		console.Fatal("Failed to create archive: %s", err)
+	}
+
+	// Get archive info
+	archiveInfo, err := os.Stat(outputPath)
+	if err != nil {
+		console.Fatal("Failed to stat archive: %s", err)
+	}
+
+	fmt.Println()
+	console.Success("Archive created successfully!")
+	fmt.Println()
+	console.Print("  ┌─ Archive Details")
+	console.Print("  │  File:    %s", outputPath)
+	console.Print("  │  Size:    %s", formatBytes(archiveInfo.Size()))
+	console.Print("  │  Runtime: %s", cfg.Runtime)
+	if excludeEnv {
+		console.Print("  │  Note:    Runtime excluded (recipient must run 'sbox build')")
+	}
+	fmt.Println()
+	console.Print("  ┌─ To use this archive")
+	console.Print("  │  1. Copy to target machine")
+	console.Print("  │  2. Extract: tar -xzf %s", filepath.Base(outputPath))
+	console.Print("  │  3. Run:     cd %s && sbox run", projectName)
+	fmt.Println()
+}
+
+func createPackMetadata(projectRoot string, cfg *config.Config) map[string]interface{} {
+	metadata := map[string]interface{}{
+		"sbox_version":    version,
+		"packed_at":       time.Now().Format(time.RFC3339),
+		"project_name":    filepath.Base(projectRoot),
+		"runtime":         cfg.Runtime,
+		"workdir":         cfg.Workdir,
+		"cmd":             cfg.Cmd,
+		"original_prefix": projectRoot, // Store original path for relocation during unpack
+	}
+
+	// Add lock info if available
+	if lock, err := config.LoadLock(projectRoot); err == nil {
+		metadata["build_info"] = map[string]string{
+			"config_hash": lock.ConfigHash,
+			"built_at":    lock.BuiltAt,
+			"runtime":     lock.Runtime,
+		}
+	}
+
+	// Add platform info
+	metadata["platform"] = config.GetPlatformKey()
+
+	// Add file counts
+	rootfsDir := config.GetRootfsDir(projectRoot)
+	if fileCount, err := countFiles(rootfsDir); err == nil {
+		metadata["rootfs_files"] = fileCount
+	}
+
+	envDir := config.GetEnvDir(projectRoot)
+	if fileCount, err := countFiles(envDir); err == nil {
+		metadata["env_files"] = fileCount
+	}
+
+	return metadata
+}
+
+func copyFileForPack(src, dst string) error {
+	// Handle symlinks
+	srcInfo, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+
+	if srcInfo.Mode()&os.ModeSymlink != 0 {
+		link, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		return os.Symlink(link, dst)
+	}
+
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+
+	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, srcInfo.Mode())
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
+}
+
+func copyDirForPack(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+
+		targetPath := filepath.Join(dst, relPath)
+
+		// Handle symlinks
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+				return err
+			}
+			return os.Symlink(link, targetPath)
+		}
+
+		if info.IsDir() {
+			return os.MkdirAll(targetPath, info.Mode())
+		}
+
+		return copyFileForPack(path, targetPath)
+	})
+}
+
+func countFiles(path string) (int, error) {
+	count := 0
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			count++
+		}
+		return nil
+	})
+	return count, err
+}
+
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// runUnpack relocates paths in an extracted sbox archive
+func runUnpack(cmd *cobra.Command, args []string) {
+	verbose, _ := cmd.Flags().GetBool("verbose")
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
+
+	// Determine project directory
+	var projectRoot string
+	var err error
+	if len(args) > 0 {
+		projectRoot, err = filepath.Abs(args[0])
+		if err != nil {
+			console.Fatal("Invalid path: %s", err)
+		}
+	} else {
+		projectRoot, err = os.Getwd()
+		if err != nil {
+			console.Fatal("Failed to get working directory: %s", err)
+		}
+	}
+
+	// Verify this is an sbox project
+	sboxDir := filepath.Join(projectRoot, ".sbox")
+	if _, err := os.Stat(sboxDir); os.IsNotExist(err) {
+		console.Fatal("Not an sbox project. No .sbox directory found at: %s", projectRoot)
+	}
+
+	projectName := filepath.Base(projectRoot)
+	console.Step("Relocating paths for: %s", projectName)
+
+	if dryRun {
+		console.Info("Dry run mode - no changes will be made")
+	}
+
+	// Try to load metadata.json to find original prefix
+	var originalPrefix string
+	metadataPath := filepath.Join(projectRoot, "metadata.json")
+	if metadataBytes, err := os.ReadFile(metadataPath); err == nil {
+		var metadata map[string]interface{}
+		if err := json.Unmarshal(metadataBytes, &metadata); err == nil {
+			if prefix, ok := metadata["original_prefix"].(string); ok {
+				originalPrefix = prefix
+			}
+		}
+	}
+
+	// If no metadata, try to detect from env.sh
+	if originalPrefix == "" {
+		envShPath := filepath.Join(sboxDir, "env.sh")
+		if content, err := os.ReadFile(envShPath); err == nil {
+			// Look for SBOX_PROJECT="..."
+			lines := strings.Split(string(content), "\n")
+			for _, line := range lines {
+				if strings.HasPrefix(line, "export SBOX_PROJECT=") {
+					// Extract the path from: export SBOX_PROJECT="/path/to/project"
+					parts := strings.SplitN(line, "=", 2)
+					if len(parts) == 2 {
+						originalPrefix = strings.Trim(parts[1], "\"'")
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Check if relocation is needed
+	if originalPrefix == projectRoot {
+		console.Success("No relocation needed - paths already match current location")
+		return
+	}
+
+	if originalPrefix == "" {
+		console.Warning("Could not determine original prefix. Will regenerate env.sh from scratch.")
+	} else {
+		console.Info("Original prefix: %s", originalPrefix)
+		console.Info("New prefix:      %s", projectRoot)
+	}
+
+	fmt.Println()
+	stats := &unpackStats{}
+
+	// 1. Regenerate env.sh
+	console.Step("Regenerating environment script...")
+	if err := regenerateEnvSh(projectRoot, dryRun, verbose); err != nil {
+		console.Fatal("Failed to regenerate env.sh: %s", err)
+	}
+	stats.envShUpdated = true
+
+	// 2. Fix conda-meta JSON files
+	console.Step("Updating conda metadata...")
+	condaMetaDir := filepath.Join(sboxDir, "env", "conda-meta")
+	if _, err := os.Stat(condaMetaDir); err == nil {
+		count, err := fixCondaMeta(condaMetaDir, originalPrefix, projectRoot, dryRun, verbose)
+		if err != nil {
+			console.Warning("Error updating conda metadata: %s", err)
+		}
+		stats.condaMetaFiles = count
+	}
+
+	// 3. Fix shebang lines in bin/ scripts
+	console.Step("Checking scripts for path references...")
+	binDir := filepath.Join(sboxDir, "env", "bin")
+	if _, err := os.Stat(binDir); err == nil && originalPrefix != "" {
+		count, err := fixShebangs(binDir, originalPrefix, projectRoot, dryRun, verbose)
+		if err != nil {
+			console.Warning("Error fixing shebangs: %s", err)
+		}
+		stats.scriptsFixed = count
+	}
+
+	// 4. Update sbox.lock
+	console.Step("Updating lock file...")
+	if err := updateLockFile(projectRoot, dryRun, verbose); err != nil {
+		if verbose {
+			console.Warning("Could not update lock file: %s", err)
+		}
+	} else {
+		stats.lockUpdated = true
+	}
+
+	// 5. Update metadata.json with new prefix
+	if _, err := os.Stat(metadataPath); err == nil {
+		console.Step("Updating metadata...")
+		if err := updateMetadata(metadataPath, projectRoot, dryRun, verbose); err != nil {
+			console.Warning("Could not update metadata: %s", err)
+		} else {
+			stats.metadataUpdated = true
+		}
+	}
+
+	// Print summary
+	fmt.Println()
+	console.Success("Path relocation complete!")
+	fmt.Println()
+	console.Print("  ┌─ Relocation Summary")
+	console.Print("  │  Project:           %s", projectName)
+	console.Print("  │  New location:      %s", projectRoot)
+	if stats.envShUpdated {
+		console.Print("  │  env.sh:            regenerated")
+	}
+	if stats.condaMetaFiles > 0 {
+		console.Print("  │  conda-meta files:  %d updated", stats.condaMetaFiles)
+	}
+	if stats.scriptsFixed > 0 {
+		console.Print("  │  scripts fixed:     %d", stats.scriptsFixed)
+	}
+	if stats.lockUpdated {
+		console.Print("  │  sbox.lock:         updated")
+	}
+	fmt.Println()
+
+	console.Print("  ┌─ Security Note")
+	console.Print("  │  This command only performed path relocation.")
+	console.Print("  │  No code was executed and nothing was downloaded.")
+	console.Print("  │  Review .sbox/config.yaml before running 'sbox run'.")
+	fmt.Println()
+
+	if dryRun {
+		console.Info("Dry run complete. Run without --dry-run to apply changes.")
+	} else {
+		console.Print("  ┌─ Next Steps")
+		console.Print("  │  1. Review config:  cat .sbox/config.yaml")
+		console.Print("  │  2. Run sandbox:    sbox run")
+		fmt.Println()
+	}
+}
+
+type unpackStats struct {
+	envShUpdated    bool
+	condaMetaFiles  int
+	scriptsFixed    int
+	lockUpdated     bool
+	metadataUpdated bool
+}
+
+// regenerateEnvSh creates a new env.sh with correct paths
+func regenerateEnvSh(projectRoot string, dryRun, verbose bool) error {
+	// Load config to get env vars
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	envDir := config.GetEnvDir(projectRoot)
+	rootfs := config.GetRootfsDir(projectRoot)
+	sboxDir := config.GetSboxDir(projectRoot)
+	scriptPath := filepath.Join(sboxDir, config.EnvScript)
+
+	content := fmt.Sprintf(`#!/bin/bash
+# sbox environment activation script
+# Source this file to activate the sandbox environment:
+#   source .sbox/env.sh
+#
+# Regenerated by: sbox unpack
+# Regenerated at: %s
+
+export SBOX_ACTIVE=1
+export SBOX_PROJECT="%s"
+
+# Python isolation
+export PYTHONNOUSERSITE=1
+export PYTHONDONTWRITEBYTECODE=1
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Paths
+export PATH="%s/bin:$PATH"
+export HOME="%s/home"
+export TMPDIR="%s/tmp"
+
+# Conda/mamba
+export CONDA_PREFIX="%s"
+export MAMBA_ROOT_PREFIX="%s/mamba"
+
+`, time.Now().Format(time.RFC3339), projectRoot, envDir, rootfs, rootfs, envDir, sboxDir)
+
+	// Add custom env vars from config
+	for key, value := range cfg.Env {
+		content += fmt.Sprintf("export %s=\"%s\"\n", key, value)
+	}
+
+	content += `
+echo "sbox environment activated"
+echo "Project: $SBOX_PROJECT"
+`
+
+	if verbose {
+		console.Info("  Writing: %s", scriptPath)
+	}
+
+	if dryRun {
+		return nil
+	}
+
+	return os.WriteFile(scriptPath, []byte(content), 0755)
+}
+
+// fixCondaMeta updates prefix paths in conda-meta/*.json files
+func fixCondaMeta(condaMetaDir, oldPrefix, newPrefix string, dryRun, verbose bool) (int, error) {
+	if oldPrefix == "" {
+		return 0, nil
+	}
+
+	count := 0
+	entries, err := os.ReadDir(condaMetaDir)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		filePath := filepath.Join(condaMetaDir, entry.Name())
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			continue
+		}
+
+		// Check if file contains old prefix
+		if !strings.Contains(string(content), oldPrefix) {
+			continue
+		}
+
+		// Replace old prefix with new prefix
+		newContent := strings.ReplaceAll(string(content), oldPrefix, newPrefix)
+
+		if verbose {
+			console.Info("  Updating: %s", entry.Name())
+		}
+
+		if !dryRun {
+			if err := os.WriteFile(filePath, []byte(newContent), 0644); err != nil {
+				return count, err
+			}
+		}
+		count++
+	}
+
+	return count, nil
+}
+
+// fixShebangs updates shebang lines in scripts that reference the old prefix
+func fixShebangs(binDir, oldPrefix, newPrefix string, dryRun, verbose bool) (int, error) {
+	count := 0
+	entries, err := os.ReadDir(binDir)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		filePath := filepath.Join(binDir, entry.Name())
+
+		// Check if it's a symlink
+		info, err := os.Lstat(filePath)
+		if err != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			continue // Skip symlinks
+		}
+
+		// Read first few bytes to check if it's a text file with shebang
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			continue
+		}
+
+		// Check if it starts with #! and contains old prefix
+		if !strings.HasPrefix(string(content), "#!") {
+			continue
+		}
+		if !strings.Contains(string(content), oldPrefix) {
+			continue
+		}
+
+		// Replace old prefix with new prefix
+		newContent := strings.ReplaceAll(string(content), oldPrefix, newPrefix)
+
+		if verbose {
+			console.Info("  Fixing shebang: %s", entry.Name())
+		}
+
+		if !dryRun {
+			if err := os.WriteFile(filePath, []byte(newContent), info.Mode()); err != nil {
+				return count, err
+			}
+		}
+		count++
+	}
+
+	return count, nil
+}
+
+// updateLockFile updates the sbox.lock with current timestamp
+func updateLockFile(projectRoot string, dryRun, verbose bool) error {
+	lockPath := config.GetLockPath(projectRoot)
+
+	lock, err := config.LoadLock(projectRoot)
+	if err != nil {
+		// Create a minimal lock file if it doesn't exist
+		lock = &config.LockData{
+			Version:    version,
+			ConfigHash: "relocated",
+			BuiltAt:    time.Now().Format(time.RFC3339),
+		}
+	}
+
+	// Update the timestamp to indicate relocation
+	lock.BuiltAt = time.Now().Format(time.RFC3339) + " (relocated)"
+
+	if verbose {
+		console.Info("  Updating: sbox.lock")
+	}
+
+	if dryRun {
+		return nil
+	}
+
+	// Write the lock file
+	content := fmt.Sprintf(`# sbox lock file
+# Auto-generated - do not edit
+
+version: %s
+config_hash: %s
+built_at: %s
+runtime: %s
+`, lock.Version, lock.ConfigHash, lock.BuiltAt, lock.Runtime)
+
+	return os.WriteFile(lockPath, []byte(content), 0644)
+}
+
+// updateMetadata updates metadata.json with new prefix
+func updateMetadata(metadataPath, newPrefix string, dryRun, verbose bool) error {
+	content, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return err
+	}
+
+	var metadata map[string]interface{}
+	if err := json.Unmarshal(content, &metadata); err != nil {
+		return err
+	}
+
+	// Update the prefix
+	metadata["original_prefix"] = newPrefix
+	metadata["relocated_at"] = time.Now().Format(time.RFC3339)
+
+	if verbose {
+		console.Info("  Updating: metadata.json")
+	}
+
+	if dryRun {
+		return nil
+	}
+
+	newContent, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(metadataPath, newContent, 0644)
 }

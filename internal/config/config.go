@@ -17,12 +17,13 @@ import (
 
 // Constants
 const (
-	SboxDir    = ".sbox"
-	ConfigFile = "config.yaml"
-	LockFile   = "sbox.lock"
-	EnvDir     = "env"
-	RootfsDir  = "rootfs"
-	EnvScript  = "env.sh"
+	SboxDir       = ".sbox"
+	ConfigFile    = "config.yaml"
+	LockFile      = "sbox.lock"
+	EnvDir        = "env"
+	RootfsDir     = "rootfs"
+	EnvScript     = "env.sh"
+	GlobalCacheName = "cache"
 )
 
 // Config represents the sandbox configuration
@@ -30,6 +31,7 @@ type Config struct {
 	Runtime string            `yaml:"runtime"`
 	Workdir string            `yaml:"workdir"`
 	Copy    []string          `yaml:"copy"`
+	Mount   []string          `yaml:"mount"`
 	Install []string          `yaml:"install"`
 	Cmd     string            `yaml:"cmd"`
 	Env     map[string]string `yaml:"env"`
@@ -39,6 +41,13 @@ type Config struct {
 type CopySpec struct {
 	Src string
 	Dst string
+}
+
+// MountSpec represents a parsed mount specification
+type MountSpec struct {
+	Src      string // Host path
+	Dst      string // Container path
+	ReadOnly bool   // Whether mount is read-only
 }
 
 // RuntimeInfo contains parsed runtime information
@@ -140,6 +149,33 @@ func (c *Config) ParseCopy() []CopySpec {
 	return specs
 }
 
+// ParseMount parses mount specifications
+// Format: /host/path:/container/path or /host/path:/container/path:ro
+func (c *Config) ParseMount() []MountSpec {
+	var specs []MountSpec
+	for _, item := range c.Mount {
+		parts := strings.Split(item, ":")
+		if len(parts) < 2 {
+			// Invalid format, skip
+			continue
+		}
+		
+		spec := MountSpec{
+			Src:      parts[0],
+			Dst:      parts[1],
+			ReadOnly: false,
+		}
+		
+		// Check for read-only flag
+		if len(parts) >= 3 && (parts[2] == "ro" || parts[2] == "readonly") {
+			spec.ReadOnly = true
+		}
+		
+		specs = append(specs, spec)
+	}
+	return specs
+}
+
 // ParseRuntime parses the runtime string
 func (c *Config) ParseRuntime() RuntimeInfo {
 	parts := strings.SplitN(c.Runtime, ":", 2)
@@ -209,6 +245,42 @@ func GetRootfsDir(projectRoot string) string {
 // GetMicromambaPath returns the micromamba binary path
 func GetMicromambaPath(projectRoot string) string {
 	return filepath.Join(projectRoot, SboxDir, "bin", "micromamba")
+}
+
+// GetGlobalSboxDir returns the global sbox directory (~/.sbox)
+func GetGlobalSboxDir() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+	return filepath.Join(homeDir, SboxDir), nil
+}
+
+// GetGlobalCacheDir returns the global cache directory (~/.sbox/cache)
+func GetGlobalCacheDir() (string, error) {
+	globalDir, err := GetGlobalSboxDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(globalDir, GlobalCacheName), nil
+}
+
+// GetGlobalMicromambaPath returns the path to the globally cached micromamba binary
+func GetGlobalMicromambaPath() (string, error) {
+	cacheDir, err := GetGlobalCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cacheDir, "bin", "micromamba"), nil
+}
+
+// GetGlobalPkgsCacheDir returns the path to the shared package cache
+func GetGlobalPkgsCacheDir() (string, error) {
+	cacheDir, err := GetGlobalCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cacheDir, "pkgs"), nil
 }
 
 // GetLockPath returns the lock file path

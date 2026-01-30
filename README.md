@@ -1,18 +1,60 @@
 # sbox
 
-A rootless, user-space sandbox runtime with Docker-like workflow - **no sudo required**.
+A secure sandbox for running AI agents with enforced isolation - **no Docker or sudo required**.
 
-sbox creates isolated environments for Python and Node.js applications using [micromamba](https://mamba.readthedocs.io/en/latest/user_guide/micromamba.html), providing container-like isolation without requiring root privileges or Docker.
+## Why sbox?
+
+AI agents are powerful but unpredictable. When you give an agent access to your system, you're trusting it not to:
+- Read sensitive files outside its workspace
+- Modify system configurations
+- Access credentials or API keys it shouldn't have
+- Interfere with other processes
+
+**sbox removes the need to trust agents** by restricting what they can access. Each agent runs in an isolated environment with:
+- Its own filesystem (no access to host files unless explicitly mounted)
+- Its own runtime (Python/Node.js isolated from system installations)
+- Controlled environment variables (only what you configure)
+- No network namespace tricks or root privileges required
+
+Think of it as a lightweight container specifically designed for AI agent workloads, with a Docker-like workflow that runs entirely in user space.
+
+## Privacy & Isolation
+
+Some AI agent tools (such as [OpenClaw](https://github.com/openclaw/openclaw)) run directly with user-level permissions by default. This means the agent may technically access your entire home directory, including private files, unless additional measures are taken.
+
+**sbox solves this problem by design.**
+
+Agents are executed inside an isolated sandbox with a virtual HOME directory. If a file is not explicitly placed inside the sandbox, it simply does not exist to the agent.
+
+**If a file is not copied or mounted, it does not exist to the agent.** Your SSH keys, cloud credentials, browser data, and personal documents remain completely invisible — not restricted, not permission-denied, but literally nonexistent from the agent's perspective. The agent cannot access, list, or even detect files outside its sandbox.
+
+| Without sbox | With sbox |
+|--------------|-----------|
+| Agent has access to `~/.ssh/`, `~/.aws/`, etc. | Agent only sees `.sbox/rootfs/home/` |
+| Agent can read browser cookies, credentials | Private files are invisible to the agent |
+| Must trust agent code completely | Zero trust - agent is contained |
+
+To make this easy to adopt, sbox provides pre-packaged releases. You can download a release, unpack it, and run agents inside a sandboxed environment in minutes — without Docker, sudo, or complex system setup:
+
+```bash
+# Download and run a pre-packaged agent environment
+curl -LO https://github.com/CVPaul/sbox/releases/latest/download/sbox-openclaw.tar.gz
+tar -xzf sbox-openclaw.tar.gz
+cd openclaw
+sbox unpack
+sbox run
+```
 
 ## Features
 
-- **No sudo required** - Runs entirely in user space
-- **Docker-like workflow** - Familiar `init`, `build`, `run` commands
-- **Multi-runtime support** - Python and Node.js
+- **Zero trust by default** - Agents can only access what you explicitly allow
+- **No sudo required** - Runs entirely in user space, no root privileges needed
+- **No Docker required** - Works on any Linux/macOS system without container runtimes
+- **AI agent ready** - Designed for running code-generating agents safely
+- **Multi-runtime support** - Python and Node.js environments
+- **Portable environments** - Pack and distribute sandboxes across machines
 - **Process management** - Background daemons, logs, and monitoring
-- **Portable environments** - Self-contained, reproducible builds
 - **Fast setup** - Uses micromamba for quick environment creation
-- **Cross-platform** - Linux (amd64/arm64) and macOS (Intel/Apple Silicon)
 
 ## Installation
 
@@ -100,6 +142,16 @@ sbox run
 | `sbox status` | Show detailed project status |
 | `sbox info` | Show environment information |
 | `sbox validate` | Validate configuration file |
+
+### Packaging & Distribution
+
+| Command | Description |
+|---------|-------------|
+| `sbox pack` | Package sandbox into portable tar.gz archive |
+| `sbox unpack` | Relocate paths in extracted archive for new location |
+| `sbox cache list` | List cached runtimes |
+| `sbox cache clean` | Remove cached runtimes |
+| `sbox cache prune` | Remove old unused cache entries |
 
 ### Command Options
 
@@ -421,6 +473,258 @@ pip list
 which node
 node --version
 npm list
+```
+
+## Directory Mounts
+
+Mount host directories into the sandbox without copying files. Mounts are implemented as symlinks, providing direct access to host files with zero copy overhead.
+
+### Configuration
+
+Add the `mount` field to `.sbox/config.yaml`:
+
+```yaml
+runtime: python:3.11
+workdir: /app
+
+copy:
+  - ./app:/app
+
+# Mount host directories into the sandbox
+mount:
+  - /path/to/data:/data           # Read-write mount
+  - /path/to/models:/models:ro    # Read-only mount (ro flag for documentation)
+  - ./local/dir:/container/path   # Relative path (resolved to project root)
+```
+
+### Mount vs Copy
+
+| Aspect | `mount` | `copy` |
+|--------|---------|--------|
+| Mechanism | Symlink | File copy |
+| Disk usage | Zero overhead | Duplicates files |
+| File changes | Instantly reflected | Requires rebuild |
+| Best for | Large datasets, shared models | Application code |
+
+### Use Cases
+
+```yaml
+# Mount large datasets
+mount:
+  - /mnt/datasets:/data
+
+# Mount pre-trained models (avoid copying GBs of weights)
+mount:
+  - ~/.cache/huggingface:/models
+
+# Mount configuration from host
+mount:
+  - /etc/myapp:/etc/myapp:ro
+
+# Mount output directory for results
+mount:
+  - ./output:/app/output
+```
+
+## Packaging & Distribution
+
+sbox pack creates a self-contained archive that can be transferred to other machines without requiring sbox to be installed on the target.
+
+### Creating a Portable Archive
+
+```bash
+# Pack the current project (creates <project>-sbox.tar.gz)
+sbox pack
+
+# Custom output path
+sbox pack --output myapp-v1.0.tar.gz
+
+# Exclude runtime environment (smaller archive, recipient must run sbox build)
+sbox pack --exclude-env
+
+# Include local cache (for offline deployment)
+sbox pack --include-cache
+```
+
+### Archive Contents
+
+The packed archive includes:
+
+```
+myproject-sbox.tar.gz
+├── .sbox/
+│   ├── config.yaml      # Project configuration
+│   ├── rootfs/          # Application files
+│   └── env/             # Runtime environment (unless --exclude-env)
+├── metadata.json        # Pack metadata (version, timestamp, checksums)
+└── README.txt           # Instructions for extraction and usage
+```
+
+### Distributing a Packed Sandbox
+
+The complete workflow for distributing sbox environments:
+
+```bash
+# === On source machine ===
+cd myproject
+sbox build                    # Build the sandbox
+sbox pack                     # Create portable archive
+
+# Transfer to target
+scp myproject-sbox.tar.gz user@remote:/path/
+
+# === On target machine ===
+cd /path
+tar -xzf myproject-sbox.tar.gz   # Manual extraction (security checkpoint)
+cd myproject
+sbox unpack                      # Relocate paths for new location
+sbox run                         # Run the application
+```
+
+### Path Relocation with `sbox unpack`
+
+When you extract a packed archive to a different path than where it was built, hardcoded paths in the environment need to be updated. The `sbox unpack` command handles this automatically:
+
+```bash
+# After extracting to a new location
+cd /new/path/myproject
+sbox unpack
+
+# With verbose output
+sbox unpack --verbose
+
+# Dry run to see what would change
+sbox unpack --dry-run
+```
+
+**What `sbox unpack` does:**
+
+1. **Regenerates `.sbox/env.sh`** with correct absolute paths
+2. **Updates conda-meta/*.json** files with new prefix paths  
+3. **Fixes shebang lines** in scripts that reference the old location
+4. **Updates sbox.lock** to reflect the relocation
+
+This is similar to `conda-unpack` - it only performs text replacement in configuration files.
+
+### Security Boundary of `sbox unpack`
+
+The `sbox unpack` command has a strict security boundary:
+
+| What it does | What it does NOT do |
+|--------------|---------------------|
+| Text replacement in config files | Execute any code |
+| Regenerate env.sh script | Download anything |
+| Update JSON metadata | Run install commands |
+| Fix hardcoded paths | Modify application code |
+
+**Security guarantees:**
+
+- **No code execution**: Only performs string replacement operations
+- **No network access**: Does not download or upload anything
+- **No side effects**: Only modifies sbox-specific configuration files
+- **Auditable**: Use `--dry-run --verbose` to see exactly what will change
+
+```bash
+# Verify changes before applying
+sbox unpack --dry-run --verbose
+
+# Example output:
+# [STEP] Relocating paths for: myproject
+# [INFO] Original prefix: /home/alice/myproject
+# [INFO] New prefix:      /home/bob/myproject
+# [STEP] Regenerating environment script...
+# [INFO]   Writing: /home/bob/myproject/.sbox/env.sh
+# [STEP] Updating conda metadata...
+# [INFO]   Updating: nodejs-22.21.1-h273caaf_1.json
+# ...
+```
+
+### When is `sbox unpack` Required?
+
+| Scenario | Unpack needed? |
+|----------|----------------|
+| Extract to same path as original build | No |
+| Extract to different path | **Yes** |
+| Extract on same machine, different user | **Yes** |
+| Extract on different machine | **Yes** |
+
+If you skip `sbox unpack` when paths differ, you'll see errors like:
+- "No such file or directory" when running commands
+- Wrong Python/Node interpreter being used
+- Environment variables pointing to non-existent paths
+
+### Safe Workflow for Receiving Archives
+
+Always inspect archives from untrusted sources before running:
+
+```bash
+# 1. Extract manually (security checkpoint)
+tar -xzf received-archive.tar.gz
+
+# 2. Inspect contents before running
+cat myproject/.sbox/config.yaml    # What command will run?
+cat myproject/metadata.json        # Where was it built?
+ls -la myproject/.sbox/rootfs/     # What files are included?
+
+# 3. Relocate paths (safe - no code execution)
+cd myproject
+sbox unpack --dry-run              # Preview changes
+sbox unpack                        # Apply changes
+
+# 4. Run only after verification
+sbox run
+```
+
+## Cache Management
+
+sbox maintains a global cache at `~/.sbox/cache/` to speed up builds and reduce disk usage.
+
+### Cache Structure
+
+```
+~/.sbox/cache/
+├── bin/
+│   └── micromamba           # Shared micromamba binary
+├── runtimes/
+│   ├── python-3.11/         # Cached Python 3.11 environment
+│   ├── python-3.12/         # Cached Python 3.12 environment
+│   └── node-22/             # Cached Node.js 22 environment
+└── pkgs/                    # Shared conda package cache
+```
+
+### Cache Commands
+
+```bash
+# List cached runtimes
+sbox cache list
+
+# Show cache location and size
+sbox cache info
+
+# Show cache path (useful for scripts)
+sbox cache path
+
+# Remove all cached runtimes
+sbox cache clean
+
+# Remove old/unused cache entries
+sbox cache prune
+```
+
+### How Caching Works
+
+1. **First build**: Downloads micromamba, creates runtime, caches it
+2. **Subsequent builds**: Copies cached runtime instead of downloading
+3. **Shared packages**: All projects share the same conda package cache
+
+```bash
+# First project - downloads and caches Python 3.11
+cd project1
+sbox build    # ~2 minutes
+
+# Second project - uses cached Python 3.11
+cd project2
+sbox build    # ~10 seconds
 ```
 
 ## Comparison with Alternatives

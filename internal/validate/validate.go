@@ -35,6 +35,7 @@ var (
 	// Regex patterns
 	runtimePattern = regexp.MustCompile(`^(python|node|nodejs):(\d+\.?\d*)$`)
 	copyPattern    = regexp.MustCompile(`^[^:]+:[^:]+$|^[^:]+$`)
+	mountPattern   = regexp.MustCompile(`^[^:]+:[^:]+(:(ro|readonly))?$`)
 	workdirPattern = regexp.MustCompile(`^/[a-zA-Z0-9_\-./]*$`)
 	envKeyPattern  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
@@ -51,6 +52,9 @@ func ValidateConfig(cfg *config.Config, projectRoot string) *ValidationResult {
 
 	// Validate copy specs
 	validateCopy(cfg, projectRoot, result)
+
+	// Validate mount specs
+	validateMount(cfg, projectRoot, result)
 
 	// Validate install commands
 	validateInstall(cfg, result)
@@ -242,6 +246,93 @@ func validateCopy(cfg *config.Config, projectRoot string, result *ValidationResu
 					Field:   fmt.Sprintf("copy[%d]", i),
 					Message: fmt.Sprintf("Destination must be absolute path: '%s'", dst),
 					Hint:    "Use an absolute path like '/app' for the destination",
+				})
+			}
+		}
+	}
+}
+
+func validateMount(cfg *config.Config, projectRoot string, result *ValidationResult) {
+	if len(cfg.Mount) == 0 {
+		// Mount is optional, no warning needed
+		return
+	}
+
+	for i, spec := range cfg.Mount {
+		// Check format: /host/path:/container/path or /host/path:/container/path:ro
+		if !mountPattern.MatchString(spec) {
+			result.Errors = append(result.Errors, ValidationError{
+				Field:   fmt.Sprintf("mount[%d]", i),
+				Message: fmt.Sprintf("Invalid mount specification: '%s'", spec),
+				Hint:    "Use format '/host/path:/container/path' or '/host/path:/container/path:ro'",
+			})
+			continue
+		}
+
+		parts := strings.Split(spec, ":")
+		if len(parts) < 2 {
+			result.Errors = append(result.Errors, ValidationError{
+				Field:   fmt.Sprintf("mount[%d]", i),
+				Message: fmt.Sprintf("Invalid mount specification: '%s'", spec),
+				Hint:    "Use format '/host/path:/container/path'",
+			})
+			continue
+		}
+
+		src := parts[0]
+		dst := parts[1]
+
+		// Resolve relative paths to project root
+		srcPath := src
+		if !filepath.IsAbs(src) {
+			srcPath = filepath.Join(projectRoot, src)
+		}
+
+		// Check source exists
+		if _, err := os.Stat(srcPath); os.IsNotExist(err) {
+			result.Warnings = append(result.Warnings, ValidationError{
+				Field:   fmt.Sprintf("mount[%d]", i),
+				Message: fmt.Sprintf("Mount source path does not exist: '%s'", src),
+				Hint:    fmt.Sprintf("Create the directory or update the path. Looked in: %s", srcPath),
+			})
+		}
+
+		// Check destination is absolute
+		if !strings.HasPrefix(dst, "/") {
+			result.Errors = append(result.Errors, ValidationError{
+				Field:   fmt.Sprintf("mount[%d]", i),
+				Message: fmt.Sprintf("Mount destination must be absolute path: '%s'", dst),
+				Hint:    "Use an absolute path like '/data' for the mount destination",
+			})
+		}
+
+		// Check for option validity
+		if len(parts) >= 3 {
+			option := parts[2]
+			if option != "ro" && option != "readonly" {
+				result.Warnings = append(result.Warnings, ValidationError{
+					Field:   fmt.Sprintf("mount[%d]", i),
+					Message: fmt.Sprintf("Unknown mount option: '%s'", option),
+					Hint:    "Valid options: 'ro' or 'readonly' for read-only mounts",
+				})
+			}
+		}
+
+		// Check for conflicts with copy destinations
+		for j, copySpec := range cfg.Copy {
+			copyParts := strings.SplitN(copySpec, ":", 2)
+			var copyDst string
+			if len(copyParts) == 2 {
+				copyDst = copyParts[1]
+			} else {
+				copyDst = copyParts[0]
+			}
+
+			if dst == copyDst || strings.HasPrefix(dst, copyDst+"/") || strings.HasPrefix(copyDst, dst+"/") {
+				result.Warnings = append(result.Warnings, ValidationError{
+					Field:   fmt.Sprintf("mount[%d]", i),
+					Message: fmt.Sprintf("Mount destination '%s' overlaps with copy destination in copy[%d]", dst, j),
+					Hint:    "Mount and copy destinations should not overlap to avoid conflicts",
 				})
 			}
 		}
@@ -453,6 +544,11 @@ workdir: /app
 copy:
   - .:/app
 
+# Directories to mount (symlink, not copy)
+# mount:
+#   - /path/to/data:/data
+#   - /path/to/models:/models:ro
+
 # Commands to run during build
 install:
   - cd /app && npm install
@@ -473,6 +569,11 @@ workdir: /app
 # Files to copy into sandbox
 copy:
   - ./app:/app
+
+# Directories to mount (symlink, not copy)
+# mount:
+#   - /path/to/data:/data
+#   - /path/to/models:/models:ro
 
 # Commands to run during build
 install:

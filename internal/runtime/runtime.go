@@ -10,26 +10,36 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/sbox-project/sbox/internal/cache"
 	"github.com/sbox-project/sbox/internal/config"
 	"github.com/sbox-project/sbox/internal/console"
 )
 
 // Manager handles runtime environment setup
 type Manager struct {
-	ProjectRoot string
-	SboxDir     string
-	EnvDir      string
-	MambaRoot   string
+	ProjectRoot  string
+	SboxDir      string
+	EnvDir       string
+	MambaRoot    string
+	CacheManager *cache.Manager
+	UseCache     bool
 }
 
 // NewManager creates a new runtime manager
 func NewManager(projectRoot string) *Manager {
 	sboxDir := config.GetSboxDir(projectRoot)
+	
+	// Try to initialize cache manager
+	cacheManager, err := cache.NewManager()
+	useCache := err == nil
+	
 	return &Manager{
-		ProjectRoot: projectRoot,
-		SboxDir:     sboxDir,
-		EnvDir:      config.GetEnvDir(projectRoot),
-		MambaRoot:   filepath.Join(sboxDir, "mamba"),
+		ProjectRoot:  projectRoot,
+		SboxDir:      sboxDir,
+		EnvDir:       config.GetEnvDir(projectRoot),
+		MambaRoot:    filepath.Join(sboxDir, "mamba"),
+		CacheManager: cacheManager,
+		UseCache:     useCache,
 	}
 }
 
@@ -48,18 +58,7 @@ func (m *Manager) Setup(info config.RuntimeInfo) error {
 func (m *Manager) setupPython(version string) error {
 	console.Step("Setting up Python %s environment...", version)
 
-	// Ensure micromamba is available
-	mambaPath, err := m.ensureMicromamba()
-	if err != nil {
-		return fmt.Errorf("failed to setup micromamba: %w", err)
-	}
-
-	// Create mamba root directory
-	if err := os.MkdirAll(m.MambaRoot, 0755); err != nil {
-		return err
-	}
-
-	// Check if environment already exists
+	// Check if environment already exists locally
 	if m.pythonEnvExists() {
 		currentVersion := m.getPythonVersion()
 		if strings.HasPrefix(currentVersion, version) {
@@ -72,33 +71,21 @@ func (m *Manager) setupPython(version string) error {
 		}
 	}
 
-	console.Step("Creating Python %s environment with micromamba...", version)
-
-	// Create environment with Python
-	cmd := exec.Command(mambaPath,
-		"create",
-		"-p", m.EnvDir,
-		"-c", "conda-forge",
-		fmt.Sprintf("python=%s", version),
-		"pip",
-		"--yes",
-		"--quiet",
-	)
-
-	cmd.Env = append(os.Environ(), fmt.Sprintf("MAMBA_ROOT_PREFIX=%s", m.MambaRoot))
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to create environment: %w", err)
+	// Try to use cached runtime first
+	if m.UseCache && m.CacheManager != nil {
+		cachedRuntime, err := m.CacheManager.GetCachedRuntime("python", version)
+		if err == nil && cachedRuntime != nil {
+			console.Step("Using cached Python %s environment...", version)
+			
+			if err := m.CacheManager.CopyFromCache("python", version, m.EnvDir); err == nil {
+				console.Success("Python %s restored from cache", version)
+				return nil
+			} else {
+				console.Warning("Failed to restore from cache: %s", err)
+				// Fall through to create new environment
+			}
+		}
 	}
-
-	console.Success("Python %s environment created", version)
-	return nil
-}
-
-func (m *Manager) setupNode(version string) error {
-	console.Step("Setting up Node.js %s environment...", version)
 
 	// Ensure micromamba is available
 	mambaPath, err := m.ensureMicromamba()
@@ -111,7 +98,55 @@ func (m *Manager) setupNode(version string) error {
 		return err
 	}
 
-	// Check if environment already exists
+	console.Step("Creating Python %s environment with micromamba...", version)
+
+	// Set package cache to global location if cache is enabled
+	env := append(os.Environ(), fmt.Sprintf("MAMBA_ROOT_PREFIX=%s", m.MambaRoot))
+	if m.UseCache && m.CacheManager != nil {
+		pkgsDir := m.CacheManager.GetPkgsDir()
+		if err := os.MkdirAll(pkgsDir, 0755); err == nil {
+			env = append(env, fmt.Sprintf("CONDA_PKGS_DIRS=%s", pkgsDir))
+		}
+	}
+
+	// Create environment with Python
+	cmd := exec.Command(mambaPath,
+		"create",
+		"-p", m.EnvDir,
+		"-c", "conda-forge",
+		fmt.Sprintf("python=%s", version),
+		"pip",
+		"--yes",
+		"--quiet",
+	)
+
+	cmd.Env = env
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to create environment: %w", err)
+	}
+
+	console.Success("Python %s environment created", version)
+
+	// Cache the runtime for future use
+	if m.UseCache && m.CacheManager != nil {
+		console.Step("Caching Python %s environment...", version)
+		if err := m.CacheManager.CopyToCache("python", version, m.EnvDir); err != nil {
+			console.Warning("Failed to cache runtime: %s", err)
+		} else {
+			console.Success("Runtime cached for future use")
+		}
+	}
+
+	return nil
+}
+
+func (m *Manager) setupNode(version string) error {
+	console.Step("Setting up Node.js %s environment...", version)
+
+	// Check if environment already exists locally
 	if m.nodeEnvExists() {
 		currentVersion := m.getNodeVersion()
 		if strings.HasPrefix(currentVersion, version) || strings.HasPrefix(currentVersion, "v"+version) {
@@ -124,7 +159,43 @@ func (m *Manager) setupNode(version string) error {
 		}
 	}
 
+	// Try to use cached runtime first
+	if m.UseCache && m.CacheManager != nil {
+		cachedRuntime, err := m.CacheManager.GetCachedRuntime("node", version)
+		if err == nil && cachedRuntime != nil {
+			console.Step("Using cached Node.js %s environment...", version)
+			
+			if err := m.CacheManager.CopyFromCache("node", version, m.EnvDir); err == nil {
+				console.Success("Node.js %s restored from cache", version)
+				return nil
+			} else {
+				console.Warning("Failed to restore from cache: %s", err)
+				// Fall through to create new environment
+			}
+		}
+	}
+
+	// Ensure micromamba is available
+	mambaPath, err := m.ensureMicromamba()
+	if err != nil {
+		return fmt.Errorf("failed to setup micromamba: %w", err)
+	}
+
+	// Create mamba root directory
+	if err := os.MkdirAll(m.MambaRoot, 0755); err != nil {
+		return err
+	}
+
 	console.Step("Creating Node.js %s environment with micromamba...", version)
+
+	// Set package cache to global location if cache is enabled
+	env := append(os.Environ(), fmt.Sprintf("MAMBA_ROOT_PREFIX=%s", m.MambaRoot))
+	if m.UseCache && m.CacheManager != nil {
+		pkgsDir := m.CacheManager.GetPkgsDir()
+		if err := os.MkdirAll(pkgsDir, 0755); err == nil {
+			env = append(env, fmt.Sprintf("CONDA_PKGS_DIRS=%s", pkgsDir))
+		}
+	}
 
 	// Create environment with Node.js and pnpm
 	cmd := exec.Command(mambaPath,
@@ -137,7 +208,7 @@ func (m *Manager) setupNode(version string) error {
 		"--quiet",
 	)
 
-	cmd.Env = append(os.Environ(), fmt.Sprintf("MAMBA_ROOT_PREFIX=%s", m.MambaRoot))
+	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -146,14 +217,47 @@ func (m *Manager) setupNode(version string) error {
 	}
 
 	console.Success("Node.js %s environment created", version)
+
+	// Cache the runtime for future use
+	if m.UseCache && m.CacheManager != nil {
+		console.Step("Caching Node.js %s environment...", version)
+		if err := m.CacheManager.CopyToCache("node", version, m.EnvDir); err != nil {
+			console.Warning("Failed to cache runtime: %s", err)
+		} else {
+			console.Success("Runtime cached for future use")
+		}
+	}
+
 	return nil
 }
 
 func (m *Manager) ensureMicromamba() (string, error) {
-	mambaPath := config.GetMicromambaPath(m.ProjectRoot)
+	// First check local project path
+	localPath := config.GetMicromambaPath(m.ProjectRoot)
+	if _, err := os.Stat(localPath); err == nil {
+		return localPath, nil
+	}
 
-	if _, err := os.Stat(mambaPath); err == nil {
-		return mambaPath, nil
+	// Check global cache if available
+	if m.UseCache && m.CacheManager != nil {
+		globalPath := m.CacheManager.GetMicromambaPath()
+		if _, err := os.Stat(globalPath); err == nil {
+			console.Step("Using cached micromamba...")
+			
+			// Create local bin directory and copy/link
+			binDir := filepath.Dir(localPath)
+			if err := os.MkdirAll(binDir, 0755); err != nil {
+				return "", err
+			}
+			
+			// Copy the binary to local project (more reliable than symlinks)
+			if err := copyFile(globalPath, localPath); err != nil {
+				return "", fmt.Errorf("failed to copy micromamba from cache: %w", err)
+			}
+			
+			console.Success("micromamba linked from cache")
+			return localPath, nil
+		}
 	}
 
 	console.Step("Downloading micromamba...")
@@ -164,7 +268,7 @@ func (m *Manager) ensureMicromamba() (string, error) {
 	}
 
 	// Create bin directory
-	binDir := filepath.Dir(mambaPath)
+	binDir := filepath.Dir(localPath)
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		return "", err
 	}
@@ -221,25 +325,47 @@ func (m *Manager) ensureMicromamba() (string, error) {
 		}
 	}
 
-	// Copy to destination
-	srcFile, err := os.Open(extractedPath)
-	if err != nil {
-		return "", err
-	}
-	defer srcFile.Close()
-
-	dstFile, err := os.OpenFile(mambaPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-	if err != nil {
-		return "", err
-	}
-	defer dstFile.Close()
-
-	if _, err := io.Copy(dstFile, srcFile); err != nil {
-		return "", err
+	// Copy to local destination
+	if err := copyFile(extractedPath, localPath); err != nil {
+		return "", fmt.Errorf("failed to copy micromamba: %w", err)
 	}
 
 	console.Success("micromamba downloaded")
-	return mambaPath, nil
+
+	// Cache the binary for future use
+	if m.UseCache && m.CacheManager != nil {
+		if err := m.CacheManager.EnsureCacheDirs(); err == nil {
+			globalPath := m.CacheManager.GetMicromambaPath()
+			if err := copyFile(localPath, globalPath); err == nil {
+				console.Success("micromamba cached for future use")
+			}
+		}
+	}
+
+	return localPath, nil
+}
+
+// copyFile copies a file from src to dst with executable permissions
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+
+	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
 }
 
 func (m *Manager) pythonEnvExists() bool {
