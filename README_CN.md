@@ -1,5 +1,7 @@
 # sbox
 
+[English](README.md) | [中文](README_CN.md)
+
 一个用于运行 AI 代理的安全沙箱，强制隔离环境 - **无需 Docker 或 sudo**。
 
 **如果文件没有被挂载，它对代理来说就不存在。**

@@ -1,5 +1,7 @@
 # sbox
 
+[English](README.md) | [中文](README_CN.md)
+
 A secure sandbox for running AI agents with enforced isolation - **no Docker or sudo required**.
 
 **If a file is not mounted, it does not exist to the agent.**
