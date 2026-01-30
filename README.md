@@ -528,7 +528,7 @@ sbox status
 #   │    • openclaw-gateway (1.2 MB)
 ```
 
-### Manual Deployment (Without sbox build)
+### Manual Deployment (Not Recommended for Untrusted Agents)
 
 If you prefer to use system-installed Node.js and pnpm:
 
