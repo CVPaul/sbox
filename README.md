@@ -2,6 +2,10 @@
 
 A secure sandbox for running AI agents with enforced isolation - **no Docker or sudo required**.
 
+> *"Don't trust the agent. Trust the sandbox."*
+>
+> sbox enforces isolation through environment, not promises. Your files are protected not because the agent behaves, but because they simply don't exist in its world.
+
 ## Why sbox?
 
 AI agents are powerful but unpredictable. When you give an agent access to your system, you're trusting it not to:
@@ -96,6 +100,92 @@ This means:
 - `npm install` writes to the sandbox, not `~/.npm`
 - Config files created by the agent stay in the sandbox
 - The agent cannot discover or access your real home directory
+
+### Package Managers are Sandboxed
+
+When you run `npm install -g`, `pip install --user`, or any package manager command inside sbox, packages are installed **into the sandbox, not your system**.
+
+**"Global" installs are sandbox-global, not system-global.**
+
+| Package Manager | Without sbox | With sbox |
+|-----------------|--------------|-----------|
+| `npm install -g` | `/usr/local/lib/node_modules/` | `.sbox/env/lib/node_modules/` |
+| `pip install --user` | `~/.local/lib/python*/` | Blocked by `PYTHONNOUSERSITE=1` |
+| `pip install` | System or venv | `.sbox/env/lib/python*/` |
+| npm cache | `~/.npm/` | `.sbox/rootfs/home/.npm/` |
+| pip cache | `~/.cache/pip/` | `.sbox/rootfs/home/.cache/pip/` |
+
+This works through environment variable redirection:
+
+```bash
+# Inside the sandbox, these are set automatically:
+HOME=/path/to/project/.sbox/rootfs/home
+TMPDIR=/path/to/project/.sbox/rootfs/tmp
+PYTHONNOUSERSITE=1        # Blocks ~/.local imports
+PATH=.sbox/env/bin:...    # Sandbox binaries first
+```
+
+Because `HOME` points to the sandbox, any tool that respects `$HOME` for cache or config storage (npm, pip, cargo, go, yarn, pnpm, etc.) will write to the sandbox instead of your real home directory.
+
+**What this means for AI agents:**
+- An agent can run `npm install -g malicious-package` — it only affects the sandbox
+- An agent can run `pip install sketchy-lib` — it cannot touch your system Python
+- An agent cannot pollute your `~/.npmrc`, `~/.pip/`, or any other dotfiles
+
+### Example: Complete Isolation Config
+
+Here's a typical `.sbox/config.yaml` for running an AI coding agent:
+
+```yaml
+# .sbox/config.yaml
+runtime: node:22
+
+# Copy only what the agent needs
+copy:
+  - src: ../my-project
+    dst: /app/workspace
+
+# Working directory inside sandbox
+workdir: /app/workspace
+
+# Command to run the agent
+cmd: node agent.js
+
+# Environment variables passed to the agent
+env:
+  OPENAI_API_KEY: "${OPENAI_API_KEY}"   # Passed from host
+  NODE_ENV: "production"
+
+# Optional: Mount directories (read-only recommended)
+mount:
+  - "/path/to/datasets:/data:ro"        # Read-only dataset access
+
+# Build-time commands (run once during 'sbox build')
+build:
+  - npm install
+  - npm run build
+```
+
+**What happens when you run `sbox build` + `sbox run`:**
+
+```
+Your System                          Sandbox (.sbox/)
+─────────────────────────────────────────────────────────────────
+~/.ssh/                         →    (not visible)
+~/.aws/                         →    (not visible)
+~/.npmrc                        →    (not visible)
+~/.gitconfig                    →    (not visible)
+
+$HOME                           →    .sbox/rootfs/home/     (empty)
+$TMPDIR                         →    .sbox/rootfs/tmp/
+$PATH                           →    .sbox/env/bin:...
+
+npm install -g <pkg>            →    .sbox/env/lib/node_modules/
+pip install <pkg>               →    .sbox/env/lib/python*/
+~/                              →    .sbox/rootfs/home/
+```
+
+The agent sees an isolated world where your credentials and system files simply don't exist.
 
 ### Directory Layout After Build
 
@@ -685,6 +775,27 @@ sbox unpack --dry-run
 4. **Updates sbox.lock** to reflect the relocation
 
 This is similar to `conda-unpack` - it only performs text replacement in configuration files.
+
+### `sbox unpack` is a Relocator, Not an Installer
+
+To be absolutely clear: **`sbox unpack` does not install anything.** It is a pure path relocator.
+
+| What people might expect | What actually happens |
+|--------------------------|----------------------|
+| Runs `npm install` or `pip install` | ❌ No package manager is invoked |
+| Executes post-install scripts | ❌ No scripts are executed |
+| Downloads dependencies from the internet | ❌ Zero network access |
+| Modifies files outside the project | ❌ Only touches `.sbox/` directory |
+| Requires elevated permissions | ❌ Runs as normal user |
+
+**The only thing `sbox unpack` does:**
+1. Read the original build path from `metadata.json`
+2. Find-and-replace that path with the current path in config files
+3. Write the updated files back
+
+No code is executed. No interpreters are invoked. No network connections are made. Files outside `.sbox/` are never read or written.
+
+This makes `sbox unpack` safe to run on untrusted archives — it cannot execute malicious code because it doesn't execute any code at all.
 
 ### Security Boundary of `sbox unpack`
 
