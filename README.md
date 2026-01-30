@@ -599,9 +599,18 @@ mount:
 
 ## Packaging & Distribution
 
-sbox pack creates a self-contained archive that can be transferred to other machines without requiring sbox to be installed on the target.
+sbox provides two commands for portable deployment:
 
-### Creating a Portable Archive
+| Command | Purpose | Executes Code? | Network Access? |
+|---------|---------|----------------|-----------------|
+| `sbox pack` | Create a portable tar.gz archive | No | No |
+| `sbox unpack` | Relocate paths after extraction | No | No |
+
+**Key concept:** `sbox pack` bundles everything needed to run the sandbox. `sbox unpack` only rewrites hardcoded paths for the new location — similar to `conda-unpack`. Neither command executes code or downloads anything.
+
+### Creating a Portable Archive with `sbox pack`
+
+`sbox pack` creates a self-contained archive that can be transferred to other machines:
 
 ```bash
 # Pack the current project (creates <project>-sbox.tar.gz)
