@@ -9,6 +9,7 @@ sbox creates isolated environments for Python and Node.js applications using [mi
 - **No sudo required** - Runs entirely in user space
 - **Docker-like workflow** - Familiar `init`, `build`, `run` commands
 - **Multi-runtime support** - Python and Node.js
+- **Process management** - Background daemons, logs, and monitoring
 - **Portable environments** - Self-contained, reproducible builds
 - **Fast setup** - Uses micromamba for quick environment creation
 - **Cross-platform** - Linux (amd64/arm64) and macOS (Intel/Apple Silicon)
@@ -70,6 +71,8 @@ sbox run
 
 ## Commands
 
+### Core Commands
+
 | Command | Description |
 |---------|-------------|
 | `sbox init <name>` | Initialize a new sbox project |
@@ -77,9 +80,25 @@ sbox run
 | `sbox run [cmd]` | Run the application (or custom command) |
 | `sbox shell` | Start an interactive shell in the sandbox |
 | `sbox exec <cmd>` | Execute a command in the sandbox |
-| `sbox status` | Show project status |
 | `sbox clean` | Clean build artifacts |
 | `sbox version` | Print version information |
+
+### Process Management
+
+| Command | Description |
+|---------|-------------|
+| `sbox run -d` | Run as a background daemon |
+| `sbox ps` | List running sandbox processes |
+| `sbox stop [name]` | Stop a running daemon |
+| `sbox restart [name]` | Restart a daemon process |
+| `sbox logs [name]` | View process logs |
+
+### Status & Info
+
+| Command | Description |
+|---------|-------------|
+| `sbox status` | Show detailed project status |
+| `sbox info` | Show environment information |
 
 ### Command Options
 
@@ -90,9 +109,36 @@ sbox init myapp --runtime node:20
 
 # Force rebuild
 sbox build --force
+sbox build --verbose
 
-# Clean everything including config
-sbox clean --all
+# Run as background daemon
+sbox run -d                    # Run default command as daemon
+sbox run -d --name myservice   # Run with custom name
+sbox run -d "node server.js"   # Run specific command
+
+# Process management
+sbox ps                        # List running processes
+sbox ps --all                  # Include stopped processes
+sbox stop myservice            # Stop specific process
+sbox stop --all                # Stop all processes
+sbox restart myservice         # Restart a process
+
+# View logs
+sbox logs                      # View default process logs
+sbox logs myservice            # View specific process logs
+sbox logs -f                   # Follow logs in real-time
+sbox logs -n 100               # Show last 100 lines
+sbox logs --list               # List available log files
+
+# Status and info
+sbox status                    # Detailed project status
+sbox status --json             # Output as JSON
+sbox info                      # Environment details
+
+# Clean up
+sbox clean                     # Clean build artifacts
+sbox clean --all               # Remove everything including config
+sbox clean --logs              # Only clean log files
 ```
 
 ## Configuration
@@ -132,6 +178,7 @@ After running `sbox init myproject`, you'll get:
 myproject/
 ├── .sbox/
 │   ├── config.yaml    # Project configuration
+│   ├── logs/          # Process log files
 │   ├── env/           # Runtime environment (after build)
 │   ├── rootfs/        # Application files (after build)
 │   ├── mamba/         # Micromamba installation (after build)
@@ -186,8 +233,14 @@ sbox build
 # Run OpenClaw
 sbox run
 
-# Or run with custom command
-sbox run "node openclaw.mjs gateway"
+# Or run as a background daemon
+sbox run -d --name openclaw-gateway "node openclaw.mjs gateway"
+
+# Check running processes
+sbox ps
+
+# View logs
+sbox logs openclaw-gateway -f
 
 # Interactive shell for debugging
 sbox shell
@@ -196,17 +249,31 @@ sbox shell
 ### Step 4: Verify
 
 ```bash
-# Check status
+# Check detailed status
 sbox status
 
 # Expected output:
 # [STEP] sbox project: openclaw
-# [OK] Config: /path/to/openclaw/.sbox/config.yaml
-#   Runtime: node:22
-#   Workdir: /app
-#   Command: node openclaw.mjs --help
-# [OK] Build status: Built
-#   Built at: 2026-01-30T12:00:00Z
+#
+#   ┌─ Configuration
+#   │  Runtime:  node:22
+#   │  Workdir:  /app
+#   │  Command:  node openclaw.mjs --help
+#   │  Env vars: 2 defined
+#
+#   ┌─ Build Status
+#   │  Status:  ✓ Built
+#   │  State:   Up to date
+#   │  Hash:    a1b2c3d4
+#   │  Built:   2026-01-30 12:00:00 (5m ago)
+#
+#   ┌─ Processes
+#   │  Running: 1
+#   │    • openclaw-gateway (PID 12345) - up 5m30s
+#
+#   ┌─ Logs
+#   │  Available: 1 log file(s)
+#   │    • openclaw-gateway (1.2 MB)
 ```
 
 ### Manual Deployment (Without sbox build)
@@ -251,6 +318,9 @@ node openclaw.mjs --help
 │   └── ...
 ├── rootfs/
 │   └── app/             # Your application files
+├── logs/
+│   └── *.log            # Process log files
+├── processes.json       # Process tracking
 └── env.sh               # Environment activation script
 ```
 
@@ -324,6 +394,8 @@ npm list
 | Multi-language | Yes | Yes | Python only | Node only |
 | Portable | Yes | Yes | No | No |
 | Fast startup | Yes | No | Yes | Yes |
+| Process management | Yes | Yes | No | No |
+| Log management | Yes | Yes | No | No |
 | Network isolation | No | Yes | No | No |
 
 *Docker can run rootless but requires additional setup

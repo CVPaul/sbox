@@ -51,8 +51,8 @@ func (r *Runner) Run(cmd string) (int, error) {
 		return 1, fmt.Errorf("no command specified and no default cmd in config")
 	}
 
-	workdir := r.resolveWorkdir()
-	env := r.buildEnv()
+	workdir := r.ResolveWorkdir()
+	env := r.BuildEnv()
 
 	console.Step("Running: %s", command)
 	console.Info("Workdir: %s", workdir)
@@ -82,8 +82,8 @@ func (r *Runner) Shell() (int, error) {
 		return 1, fmt.Errorf("sandbox not built. Run 'sbox build' first")
 	}
 
-	workdir := r.resolveWorkdir()
-	env := r.buildEnv()
+	workdir := r.ResolveWorkdir()
+	env := r.BuildEnv()
 
 	shell := os.Getenv("SHELL")
 	if shell == "" {
@@ -123,8 +123,8 @@ func (r *Runner) Exec(args []string) (int, error) {
 		return 1, fmt.Errorf("no command provided")
 	}
 
-	workdir := r.resolveWorkdir()
-	env := r.buildEnv()
+	workdir := r.ResolveWorkdir()
+	env := r.BuildEnv()
 
 	execCmd := exec.Command(args[0], args[1:]...)
 	execCmd.Dir = workdir
@@ -144,7 +144,8 @@ func (r *Runner) Exec(args []string) (int, error) {
 	return 0, nil
 }
 
-func (r *Runner) resolveWorkdir() string {
+// ResolveWorkdir returns the resolved working directory path
+func (r *Runner) ResolveWorkdir() string {
 	workdirConfig := r.Config.Workdir
 
 	var resolved string
@@ -166,7 +167,8 @@ func (r *Runner) resolveWorkdir() string {
 	return resolved
 }
 
-func (r *Runner) buildEnv() []string {
+// BuildEnv returns the environment variables for the sandbox
+func (r *Runner) BuildEnv() []string {
 	var env []string
 
 	// Essential system vars
