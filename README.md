@@ -642,6 +642,8 @@ npm list
 
 Mount host directories into the sandbox without copying files. Mounts are implemented as symlinks, providing direct access to host files with zero copy overhead.
 
+> **Warning:** Mounts intentionally expose host paths to the sandbox and should be treated as explicit trust boundaries.
+
 ### Configuration
 
 Add the `mount` field to `.sbox/config.yaml`:
