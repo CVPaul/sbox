@@ -99,6 +99,7 @@ sbox run
 |---------|-------------|
 | `sbox status` | Show detailed project status |
 | `sbox info` | Show environment information |
+| `sbox validate` | Validate configuration file |
 
 ### Command Options
 
@@ -134,6 +135,8 @@ sbox logs --list               # List available log files
 sbox status                    # Detailed project status
 sbox status --json             # Output as JSON
 sbox info                      # Environment details
+sbox validate                  # Validate configuration
+sbox validate --quiet          # Only show errors
 
 # Clean up
 sbox clean                     # Clean build artifacts
@@ -169,6 +172,40 @@ env:
   PYTHONPATH: /app
   DEBUG: "true"
 ```
+
+### Configuration Validation
+
+sbox validates your configuration before build/run and provides helpful error messages:
+
+```bash
+# Validate configuration
+sbox validate
+
+# Example output for invalid config:
+# [STEP] Validating configuration: .sbox/config.yaml
+#
+# [ERROR] Configuration errors (2):
+#
+#   1. [runtime] Invalid runtime format: 'ruby:3.0'
+#      → Use format 'language:version', e.g., 'python:3.11' or 'node:22'
+#
+#   2. [workdir] Workdir must be an absolute path: 'relative/path'
+#      → Use an absolute path like '/app' or '/home/user/app'
+#
+# [WARN] Configuration warnings (1):
+#
+#   1. [install[0]] Using sudo in install command
+#      → sbox runs in user space - sudo is not needed
+```
+
+Validation checks:
+- **Runtime format**: Must be `language:version` (e.g., `python:3.11`, `node:22`)
+- **Supported languages**: `python`, `node` (with recommended versions)
+- **Workdir**: Must be an absolute path
+- **Copy specs**: Valid format and source existence
+- **Install commands**: Runtime compatibility, sudo usage warnings
+- **Environment variables**: Valid naming, reserved variable warnings
+- **Security**: Warnings for plain-text secrets
 
 ## Project Structure
 

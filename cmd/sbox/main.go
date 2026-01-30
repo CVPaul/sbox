@@ -17,9 +17,10 @@ import (
 	"github.com/sbox-project/sbox/internal/console"
 	"github.com/sbox-project/sbox/internal/process"
 	"github.com/sbox-project/sbox/internal/runner"
+	"github.com/sbox-project/sbox/internal/validate"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
 	rootCmd := &cobra.Command{
@@ -177,6 +178,25 @@ Use --logs to only clean log files.`,
 		Run:   runInfo,
 	}
 	rootCmd.AddCommand(infoCmd)
+
+	// Validate command - check config validity
+	validateCmd := &cobra.Command{
+		Use:   "validate",
+		Short: "Validate the configuration file",
+		Long: `Validate the sbox configuration file for errors and warnings.
+
+Checks for:
+- Required fields (runtime, workdir, etc.)
+- Valid runtime format and supported versions
+- Copy specification syntax and source existence
+- Install command compatibility with runtime
+- Environment variable naming and reserved names
+- Common configuration mistakes`,
+		Run: runValidate,
+	}
+	validateCmd.Flags().BoolP("quiet", "q", false, "Only show errors, not warnings")
+	validateCmd.Flags().Bool("fix", false, "Attempt to fix common issues")
+	rootCmd.AddCommand(validateCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -351,6 +371,33 @@ func runBuild(cmd *cobra.Command, args []string) {
 		console.Fatal("Failed to load config: %s", err)
 	}
 
+	// Validate configuration before building
+	console.Info("Validating configuration...")
+	validationResult := validate.ValidateConfig(cfg, projectRoot)
+
+	if !validationResult.Valid {
+		console.Error("Configuration validation failed:")
+		fmt.Println()
+		for _, verr := range validationResult.Errors {
+			console.Print("  ✗ %s: %s", verr.Field, verr.Message)
+			if verr.Hint != "" {
+				console.Print("    → %s", verr.Hint)
+			}
+		}
+		fmt.Println()
+		console.Fatal("Fix the configuration errors above and try again. Run 'sbox validate' for more details.")
+	}
+
+	// Show warnings but continue
+	if len(validationResult.Warnings) > 0 {
+		console.Warning("Configuration has %d warning(s):", len(validationResult.Warnings))
+		for _, warn := range validationResult.Warnings {
+			console.Print("  ⚠ %s: %s", warn.Field, warn.Message)
+		}
+		fmt.Println()
+	}
+
+	console.Success("Configuration validated")
 	console.Info("Runtime: %s", cfg.Runtime)
 	console.Info("Workdir: %s", cfg.Workdir)
 
@@ -396,6 +443,16 @@ func runRun(cmd *cobra.Command, args []string) {
 
 	if name == "" {
 		name = filepath.Base(projectRoot)
+	}
+
+	// Quick validation before running
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		console.Fatal("Failed to load config: %s", err)
+	}
+
+	if err := validate.QuickValidate(cfg, projectRoot); err != nil {
+		console.Fatal("Configuration error: %s\n\nRun 'sbox validate' for detailed diagnostics.", err)
 	}
 
 	r, err := runner.New(projectRoot)
@@ -1047,4 +1104,107 @@ func loadLockJSON(path string) map[string]interface{} {
 	var result map[string]interface{}
 	json.Unmarshal(data, &result)
 	return result
+}
+
+func runValidate(cmd *cobra.Command, args []string) {
+	quiet, _ := cmd.Flags().GetBool("quiet")
+	fix, _ := cmd.Flags().GetBool("fix")
+
+	projectRoot, err := config.GetProjectRoot("")
+	if err != nil {
+		console.Fatal("Not in an sbox project. Run 'sbox init <name>' first.")
+	}
+
+	configPath := filepath.Join(config.GetSboxDir(projectRoot), config.ConfigFile)
+
+	fmt.Println()
+	console.Step("Validating configuration: %s", configPath)
+	fmt.Println()
+
+	// Check if config file exists
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		console.Fatal("Config file not found: %s\n  → Run 'sbox init <name>' to create a new project", configPath)
+	}
+
+	// Load config
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		console.Error("Failed to parse config file:")
+		console.Print("  %s", err)
+		fmt.Println()
+		console.Print("Common causes:")
+		console.Print("  • Invalid YAML syntax (check indentation)")
+		console.Print("  • Missing colons after field names")
+		console.Print("  • Unquoted special characters")
+		fmt.Println()
+		console.Print("Example valid config:")
+		fmt.Println()
+		console.Print(validate.GetConfigExample("python"))
+		os.Exit(1)
+	}
+
+	// Validate
+	result := validate.ValidateConfig(cfg, projectRoot)
+
+	// Display results
+	if len(result.Errors) > 0 {
+		console.Error("Configuration errors (%d):", len(result.Errors))
+		fmt.Println()
+		for i, verr := range result.Errors {
+			console.Print("  %d. [%s] %s", i+1, verr.Field, verr.Message)
+			if verr.Hint != "" {
+				console.Print("     → %s", verr.Hint)
+			}
+			fmt.Println()
+		}
+	}
+
+	if !quiet && len(result.Warnings) > 0 {
+		console.Warning("Configuration warnings (%d):", len(result.Warnings))
+		fmt.Println()
+		for i, warn := range result.Warnings {
+			console.Print("  %d. [%s] %s", i+1, warn.Field, warn.Message)
+			if warn.Hint != "" {
+				console.Print("     → %s", warn.Hint)
+			}
+			fmt.Println()
+		}
+	}
+
+	// Summary
+	fmt.Println()
+	if result.Valid {
+		if len(result.Warnings) > 0 {
+			console.Success("Configuration is valid with %d warning(s)", len(result.Warnings))
+		} else {
+			console.Success("Configuration is valid")
+		}
+		fmt.Println()
+		console.Print("  You can now run:")
+		console.Print("    sbox build     Build the sandbox")
+		console.Print("    sbox run       Run the application")
+	} else {
+		console.Error("Configuration is invalid with %d error(s)", len(result.Errors))
+		fmt.Println()
+		console.Print("  Please fix the errors above and run 'sbox validate' again.")
+
+		if fix {
+			fmt.Println()
+			console.Info("Auto-fix is not yet implemented.")
+			console.Print("  Please manually edit: %s", configPath)
+		}
+
+		os.Exit(1)
+	}
+	fmt.Println()
+
+	// Show config summary
+	console.Print("  ┌─ Config Summary")
+	console.Print("  │  Runtime:  %s", cfg.Runtime)
+	console.Print("  │  Workdir:  %s", cfg.Workdir)
+	console.Print("  │  Command:  %s", cfg.Cmd)
+	console.Print("  │  Copy:     %d mapping(s)", len(cfg.Copy))
+	console.Print("  │  Install:  %d command(s)", len(cfg.Install))
+	console.Print("  │  Env vars: %d defined", len(cfg.Env))
+	fmt.Println()
 }
