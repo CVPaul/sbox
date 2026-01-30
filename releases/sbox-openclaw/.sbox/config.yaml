@@ -1,0 +1,27 @@
+# sbox configuration for OpenClaw AI agent
+# https://github.com/openclaw/openclaw
+
+runtime: node:22
+
+# Working directory inside sandbox
+workdir: /app
+
+# Copy application code into sandbox
+# Uncomment and modify to include your openclaw installation:
+# copy:
+#   - ../openclaw:/app/openclaw
+
+# Environment variables
+env:
+  NODE_ENV: "production"
+  # Add your API keys here (passed from host):
+  # OPENAI_API_KEY: "${OPENAI_API_KEY}"
+  # ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+
+# Build-time commands (run during 'sbox build')
+build:
+  - npm install -g pnpm
+
+# Command to run the agent
+# Uncomment after copying openclaw:
+# cmd: pnpm start
